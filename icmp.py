@@ -5,74 +5,84 @@ import struct
 import time
 import select
 
+
 def resolve_hostname_to_ip(hostname):
     try:
-        ip=socket.gethostbyname(hostname)
-        return ip
+        return socket.gethostbyname(hostname)
     except socket.gaierror:
         return None
 
+
 def create_socket():
     try:
-        return socket.socket(socket.AF_INET, socket.sock_RAM, socket.IPPROTO_ICMP)
+        return socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
     except PermissionError:
-        print("YOU DONT HAVE AMDIN PREMESIONS !!! Run it as admin")
-        sys.exit()
+        print("Permission denied! Jalankan dengan sudo: sudo python3 icmp.py")
+        sys.exit(1)
 
-def checksum(source_byte):
 
-    sum = 0
+def checksum(source_bytes):
+    total = 0
+    count_to = (len(source_bytes) // 2) * 2
 
-    count_to =(len(source_byte)// 2)*2
-
+    # jumlahkan per 16 bit (big-endian / network byte order)
     for count in range(0, count_to, 2):
-        this_val = source_byte[count + 1] * 256 + source_byte[count]
-        sum = sum + this_val
-        sum = sum & 0xffffffff
+        total += (source_bytes[count] << 8) + source_bytes[count + 1]
 
-    if count_to < len(source_byte):
-        sum = sum + source_byte[-1]
-        sum = sum & 0xffffffff
+    # kalau jumlah byte ganjil, byte terakhir jadi high byte
+    if count_to < len(source_bytes):
+        total += source_bytes[-1] << 8
 
-    sum = (sum >> 16) + (sum & 0xffff)
-    sum = sum +(sum >> 16)
+    # lipat carry ke 16 bit
+    total = (total >> 16) + (total & 0xFFFF)
+    total += total >> 16
+
+    return ~total & 0xFFFF
 
 
-    answer = ~sum & 0xffff
-    return answer
-
-def build_packet(id, sequence_number):
-    icmp_type = 8
+def build_packet(identifier, sequence_number):
+    icmp_type = 8   # Echo Request
     icmp_code = 0
-    checksum_dummy = 0
     payload_data = b"PingPython"
 
-    header = struct.pack("bbHHh",icmp_type,icmp_code,checksum_dummy,id, sequence_number)
-    packet = header + payload_data
+    # header dengan checksum = 0 dulu
+    header = struct.pack("!BBHHH", icmp_type, icmp_code, 0, identifier, sequence_number)
+    calculated_checksum = checksum(header + payload_data)
 
-    calculated_checksum = checksum_dummy(packet)
-
-    header = struct.pack("bbHHh",icmp_type,icmp_code,calculated_checksum,id, sequence_number)
-
+    # susun ulang header dengan checksum yang benar
+    header = struct.pack("!BBHHH", icmp_type, icmp_code, calculated_checksum,
+                         identifier, sequence_number)
     return header + payload_data
 
-def send_and_receive(icmp_socket, packet, destination_ip, identifier, timeout=1):
+
+def send_and_receive(icmp_socket, packet, destination_ip, identifier, sequence_number, timeout=1):
     send_time = time.time()
-    icmp_socket.sendto(packet, (destination_ip, 1))
+    icmp_socket.sendto(packet, (destination_ip, 0))
+    deadline = send_time + timeout
 
     while True:
-        ready = select.select([icmp_socket], [], [], timeout)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return None  # timeout
+
+        ready = select.select([icmp_socket], [], [], remaining)
         if not ready[0]:
-            return None   # timeout
+            return None  # timeout
 
-        recv_time = time.time()
         recv_packet, addr = icmp_socket.recvfrom(1024)
+        recv_time = time.time()
 
-        icmp_header = recv_packet[20:28]
-        _type, code, recv_checksum, recv_id, sequence = struct.unpack("bbHHh", icmp_header)
+        # panjang header IP dari field IHL (4 bit bawah byte pertama, satuan 4 byte)
+        ip_header_len = (recv_packet[0] & 0x0F) * 4
+        icmp_header = recv_packet[ip_header_len:ip_header_len + 8]
+        if len(icmp_header) < 8:
+            continue
 
-        if _type == 0 and recv_id == identifier:
-            return (recv_time - send_time) * 1000   # RTT dalam ms
+        _type, code, recv_checksum, recv_id, recv_seq = struct.unpack("!BBHHH", icmp_header)
+
+        if _type == 0 and recv_id == identifier and recv_seq == sequence_number:
+            return (recv_time - send_time) * 1000  # RTT dalam ms
+
 
 if __name__ == "__main__":
 
@@ -89,11 +99,11 @@ if __name__ == "__main__":
             print("Please enter a number between 1 and 3")
         except ValueError:
             print("Please enter a valid number")
-    
+
     target_hosts = {
         1: "8.8.8.8",
         2: "1.1.1.1",
-        3: "142.250.70.196"
+        3: "www.google.com",
     }
 
     target_host = target_hosts[choice]
@@ -102,33 +112,33 @@ if __name__ == "__main__":
         print(f"Could not resolve hostname: {target_host}")
         sys.exit(1)
 
-    print(f"pinging {target_host} [{ip}]")
-
     icmp_socket = create_socket()
 
     packet_id = os.getpid() & 0xFFFF
-    seq_num = 1
     rtts = []
     received = 0
 
-    print(f"Pinging {ip} in Python...")
+    print(f"Pinging {target_host} [{ip}] with Python...")
 
-    for seq_num in range(1, 5):
-        packet = build_packet(packet_id, seq_num)
-        delay = send_and_receive(icmp_socket, packet, ip, packet_id)
-        if delay is None:
-            print("Request timed out.")
-        else:
-            rtts.append(delay)
-            received += 1
-            print(f"Reply from {ip}: icmp_seq={seq_num} RTT={delay:.2f} ms")
+    try:
+        for seq_num in range(1, 5):
+            packet = build_packet(packet_id, seq_num)
+            delay = send_and_receive(icmp_socket, packet, ip, packet_id, seq_num)
+            if delay is None:
+                print("Request timed out.")
+            else:
+                rtts.append(delay)
+                received += 1
+                print(f"Reply from {ip}: icmp_seq={seq_num} RTT={delay:.2f} ms")
+            time.sleep(1)
+    finally:
+        icmp_socket.close()
 
     print(f"\n========== Ping statistics for {ip}: ==========")
     print(f"    Packets: Sent = 4, Received = {received}, Lost = {4 - received},")
     print(f"    Approximate round trip times in milli-seconds:")
-    if rtts:  # Only calculate statistics if received packets
-        print(f"        Minimum = {min(rtts):.2f}, Maximum = {max(rtts):.2f}, Average = {sum(rtts)/len(rtts):.2f}")
+    if rtts:
+        print(f"        Minimum = {min(rtts):.2f}, Maximum = {max(rtts):.2f}, "
+              f"Average = {sum(rtts)/len(rtts):.2f}")
     else:
         print("        No packets received - cannot calculate RTT statistics")
-    
-    
